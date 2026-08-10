@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  printf 'ios-sim-gate: requires bash 4+; found %s\n' "${BASH_VERSION:-unknown}" >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 STATE_ROOT="${IOS_SIM_GATE_HOME:-$HOME/Library/Application Support/ios-sim-gate}"
@@ -157,7 +162,12 @@ acquire_registry_lock() {
   fi
   case "$flock_rc" in
     0) ;;
-    1) die "timed out after ${wait_seconds}s waiting for registry lock" ;;
+    1)
+      if [ "$wait_seconds" -eq 0 ]; then
+        die "wait budget exhausted while waiting for registry lock"
+      fi
+      die "timed out after ${wait_seconds}s waiting for registry lock"
+      ;;
     *) die "could not acquire registry lock (flock status $flock_rc)" ;;
   esac
 }

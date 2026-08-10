@@ -10,7 +10,8 @@ and registers the exact UUID it chose.
 ## Requirements and installation
 
 Install Bash, `jq`, and `flock` with Homebrew. The CLI specifically validates
-`/opt/homebrew/bin/flock`; its default `jq` path is `/opt/homebrew/bin/jq`.
+`/opt/homebrew/bin/flock`; its default `jq` path is `/opt/homebrew/bin/jq`. The CLI requires Bash
+4 or newer and exits with a clear version diagnostic when `env bash` resolves to macOS Bash 3.2.
 
 ```bash
 ./install.sh

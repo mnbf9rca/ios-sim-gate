@@ -189,6 +189,26 @@ test_corrupt_registry_fails_closed() {
     "$(tr -d '\n' <"$IOS_SIM_GATE_HOME/registry.json")"
 }
 
+test_zero_registry_wait_reports_exhausted_budget() {
+  setup_test
+  register_uuid 78888888-8888-8888-8888-888888888888 build1
+  "$HOLD_LOCK_HELPER" "$IOS_SIM_GATE_HOME/locks/registry.lock" \
+    "$TEST_ROOT/zero-registry-ready" "$TEST_ROOT/zero-registry-release" &
+  local lock_pid=$!
+  wait_for_file "$TEST_ROOT/zero-registry-ready"
+
+  IOS_SIM_GATE_WAIT_SECONDS=0 run_cli register --project family-foqos --agent build2 \
+    --udid 79999999-9999-9999-9999-999999999999
+
+  assert_equal "zero registry wait fails" "1" "$COMMAND_STATUS"
+  assert_contains "zero registry wait reports exhausted budget" \
+    "wait budget exhausted while waiting for registry lock" "$COMMAND_OUTPUT"
+  assert_not_contains "zero registry wait avoids zero-second timeout wording" \
+    "timed out after 0s" "$COMMAND_OUTPUT"
+  touch "$TEST_ROOT/zero-registry-release"
+  wait "$lock_pid"
+}
+
 run_registry_tests() {
   test_register_creates_flat_entry
   test_register_stores_optional_session
@@ -197,6 +217,7 @@ run_registry_tests() {
   test_register_rejects_uuid_owned_by_someone_else
   test_register_rejects_invalid_uuid
   test_corrupt_registry_fails_closed
+  test_zero_registry_wait_reports_exhausted_budget
 }
 
 test_run_exports_environment_and_preserves_exit_status() {
@@ -695,6 +716,20 @@ test_installer_refuses_regular_file_collision() {
     "$(tr -d '\n' <"$TEST_ROOT/home/.local/bin/ios-sim-gate")"
 }
 
+test_system_bash_fails_with_clean_version_diagnostic() {
+  setup_test
+  set +e
+  COMMAND_OUTPUT="$(/bin/bash "$CLI" --version 2>&1)"
+  COMMAND_STATUS=$?
+  set -e
+
+  assert_equal "system Bash is rejected" "1" "$COMMAND_STATUS"
+  assert_contains "system Bash rejection explains requirement" \
+    "requires bash 4+; found" "$COMMAND_OUTPUT"
+  assert_not_contains "system Bash rejection avoids unbound-variable noise" \
+    "unbound variable" "$COMMAND_OUTPUT"
+}
+
 test_readme_records_safety_and_wait_contracts() {
   assert_file_contains "README documents kernel-arbitrary wake order" \
     "kernel-arbitrary, not FIFO" "$ROOT/README.md"
@@ -723,6 +758,7 @@ test_readme_records_safety_and_wait_contracts() {
 run_install_tests() {
   test_version_and_installer_contract
   test_installer_refuses_regular_file_collision
+  test_system_bash_fails_with_clean_version_diagnostic
   test_readme_records_safety_and_wait_contracts
 }
 
