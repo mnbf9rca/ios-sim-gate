@@ -11,6 +11,7 @@ WAIT_SECONDS="${IOS_SIM_GATE_WAIT_SECONDS:-1800}"
 CACHE_ROOT="${IOS_SIM_GATE_CACHE_HOME:-$HOME/Library/Caches/ios-sim-gate}"
 SIMCTL_BIN="${IOS_SIM_GATE_SIMCTL_BIN:-}"
 STALE_SECONDS="${IOS_SIM_GATE_STALE_SECONDS:-604800}"
+CAP="${IOS_SIM_GATE_CAP:-3}"
 
 die() {
   printf 'ios-sim-gate: %s\n' "$1" >&2
@@ -45,6 +46,13 @@ validate_stale_seconds() {
   case "$STALE_SECONDS" in
     0|[1-9]|[1-9][0-9]*) ;;
     *) die "IOS_SIM_GATE_STALE_SECONDS must be a canonical non-negative integer" ;;
+  esac
+}
+
+validate_capacity() {
+  case "$CAP" in
+    1|2|3) ;;
+    *) die "IOS_SIM_GATE_CAP must be between 1 and 3" ;;
   esac
 }
 
@@ -383,7 +391,7 @@ status_command() {
   load_inventory "$normal_inventory" list devices --json
   load_inventory "$testing_inventory" --set testing list devices --json
 
-  printf 'capacity slots=3 admission=%s\n' "$(lock_status "$LOCK_ROOT/admission.lock")"
+  printf 'capacity slots=%s admission=%s\n' "$CAP" "$(lock_status "$LOCK_ROOT/admission.lock")"
   for uuid in 1 2 3; do
     printf 'slot=%s lock=%s\n' "$uuid" "$(lock_status "$LOCK_ROOT/slots/$uuid.lock")"
   done
@@ -573,8 +581,8 @@ acquire_global_slot() {
 
   checksum="$(printf '%s' "$RUN_UUID" | cksum)"
   checksum="${checksum%% *}"
-  for offset in 0 1 2; do
-    slot=$(((checksum + offset) % 3 + 1))
+  for ((offset = 0; offset < CAP; offset++)); do
+    slot=$(((checksum + offset) % CAP + 1))
     exec 9>>"$LOCK_ROOT/slots/$slot.lock"
     flock_rc=0
     "$FLOCK_BIN" -n -x 9 || flock_rc=$?
@@ -586,7 +594,7 @@ acquire_global_slot() {
     exec 9>&-
   done
 
-  slot=$((checksum % 3 + 1))
+  slot=$((checksum % CAP + 1))
   exec 9>>"$LOCK_ROOT/slots/$slot.lock"
   acquire_run_lock "global simulator slot" -x 9
   IOS_SIM_GATE_SLOT="$slot"
@@ -640,6 +648,7 @@ run_command() {
 require_executable "$FLOCK_BIN"
 require_executable "$JQ_BIN"
 validate_wait_seconds
+validate_capacity
 
 case "${1:-}" in
   register) shift; register_simulator "$@" ;;

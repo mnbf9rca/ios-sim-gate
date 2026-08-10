@@ -8,6 +8,7 @@ ENV_HELPER="$ROOT/tests/helpers/child-env.sh"
 HOLD_HELPER="$ROOT/tests/helpers/hold.sh"
 HOLD_LOCK_HELPER="$ROOT/tests/helpers/hold-lock.sh"
 FAKE_SIMCTL="$ROOT/tests/helpers/fake-simctl.sh"
+SPAWN_HOLDER_HELPER="$ROOT/tests/helpers/spawn-holder.sh"
 JQ_BIN="${IOS_SIM_GATE_TEST_JQ_BIN:-/opt/homebrew/bin/jq}"
 GROUP="${1:-all}"
 PASS_COUNT=0
@@ -311,11 +312,63 @@ JSON
   done
 }
 
+test_operator_can_lower_but_not_raise_cap() {
+  setup_test
+  local uuid_one="85555555-5555-5555-5555-555555555551"
+  local uuid_two="85555555-5555-5555-5555-555555555552"
+  register_uuid "$uuid_one" build1
+  register_uuid "$uuid_two" build2
+  cat >"$IOS_SIM_GATE_SIMCTL_DEVICES" <<JSON
+{"devices":{"runtime":[
+  {"udid":"$uuid_one","name":"Cap One","state":"Shutdown"},
+  {"udid":"$uuid_two","name":"Cap Two","state":"Shutdown"}
+]}}
+JSON
+
+  IOS_SIM_GATE_CAP=1 "$CLI" run --project family-foqos --agent build1 --udid "$uuid_one" -- \
+    "$HOLD_HELPER" "$TEST_ROOT/cap-ready" "$TEST_ROOT/cap-release" \
+    >"$TEST_ROOT/cap-one.log" 2>&1 &
+  local cap_pid=$!
+  wait_for_file "$TEST_ROOT/cap-ready"
+  IOS_SIM_GATE_CAP=1 IOS_SIM_GATE_WAIT_SECONDS=0 run_cli run \
+    --project family-foqos --agent build2 --udid "$uuid_two" -- /usr/bin/true
+  assert_equal "lowered cap blocks second run" "1" "$COMMAND_STATUS"
+  assert_contains "lowered cap reports global timeout" "global simulator slot" "$COMMAND_OUTPUT"
+  touch "$TEST_ROOT/cap-release"
+  wait "$cap_pid"
+
+  IOS_SIM_GATE_CAP=4 run_cli status
+  assert_equal "cap above three is rejected" "1" "$COMMAND_STATUS"
+  assert_contains "cap rejection explains range" "between 1 and 3" "$COMMAND_OUTPUT"
+}
+
+test_descendant_inherits_uuid_and_slot_locks() {
+  setup_test
+  local uuid="86666666-6666-6666-6666-666666666666"
+  register_uuid "$uuid" build2
+  cat >"$IOS_SIM_GATE_SIMCTL_DEVICES" <<JSON
+{"devices":{"runtime":[{"udid":"$uuid","name":"Inherited","state":"Shutdown"}]}}
+JSON
+
+  run_cli run --project family-foqos --agent build2 --udid "$uuid" -- \
+    "$SPAWN_HOLDER_HELPER" "$TEST_ROOT/descendant-ready" "$TEST_ROOT/descendant-release"
+  assert_equal "wrapper exits after spawning descendant" "0" "$COMMAND_STATUS"
+  wait_for_file "$TEST_ROOT/descendant-ready"
+
+  IOS_SIM_GATE_WAIT_SECONDS=0 run_cli run --project family-foqos --agent build2 \
+    --udid "$uuid" -- /usr/bin/true
+  assert_equal "descendant retains inherited UUID lock" "1" "$COMMAND_STATUS"
+  assert_contains "descendant lock rejection names UUID" "simulator $uuid" "$COMMAND_OUTPUT"
+  touch "$TEST_ROOT/descendant-release"
+}
+
 run_run_tests() {
   test_run_exports_environment_and_preserves_exit_status
   test_run_rejects_registry_owner_mismatch
   test_same_uuid_runs_serialize
   test_global_cap_allows_three_and_times_out_fourth
+  test_operator_can_lower_but_not_raise_cap
+  test_descendant_inherits_uuid_and_slot_locks
 }
 
 write_cleanup_inventory() {
