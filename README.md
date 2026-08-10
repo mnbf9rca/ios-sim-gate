@@ -48,9 +48,13 @@ ios-sim-gate run \
 ```
 
 The command receives `IOS_SIM_GATE_UDID`, `IOS_SIM_GATE_DESTINATION`,
-`IOS_SIM_GATE_DERIVED_DATA_PATH`, `IOS_SIM_GATE_PROJECT`, `IOS_SIM_GATE_AGENT`, and
+`IOS_SIM_GATE_DERIVED_DATA_PATH`, `IOS_SIM_GATE_PROJECT`, `IOS_SIM_GATE_AGENT`, and, when supplied,
 `IOS_SIM_GATE_SESSION`. `IOS_SIM_GATE_DESTINATION` is always
 `platform=iOS Simulator,id=<UUID>`; device-name destinations are not produced.
+
+`IOS_SIM_GATE_SESSION` is unset when `--session` is omitted. DerivedData uses a `no-session`
+component in that case and a `session-<name>` component when a session is explicit, so an explicit
+`--session default` never collides with the no-session owner.
 
 Inspect or reconcile state:
 

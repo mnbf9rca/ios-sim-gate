@@ -219,9 +219,63 @@ test_run_exports_environment_and_preserves_exit_status() {
     "$(sed -n 's/^IOS_SIM_GATE_AGENT=//p' "$environment_file")"
   assert_equal "run exports empty session" "" \
     "$(sed -n 's/^IOS_SIM_GATE_SESSION=//p' "$environment_file")"
+  assert_equal "run leaves absent session unset" "" \
+    "$(sed -n 's/^IOS_SIM_GATE_SESSION_IS_SET=//p' "$environment_file")"
   assert_equal "run exports stable DerivedData path" \
-    "$IOS_SIM_GATE_CACHE_HOME/DerivedData/family-foqos/build2/default" \
+    "$IOS_SIM_GATE_CACHE_HOME/DerivedData/family-foqos/build2/no-session" \
     "$(sed -n 's/^IOS_SIM_GATE_DERIVED_DATA_PATH=//p' "$environment_file")"
+}
+
+test_run_distinguishes_explicit_default_session() {
+  setup_test
+  local uuid="81222222-2222-2222-2222-222222222222"
+  local environment_file="$TEST_ROOT/session-environment"
+  register_uuid "$uuid" build2
+  run_cli register --project family-foqos --agent build2 --session default \
+    --udid 81222222-2222-2222-2222-222222222223
+  cat >"$IOS_SIM_GATE_SIMCTL_DEVICES" <<JSON
+{"devices":{"runtime":[
+  {"udid":"$uuid","name":"No Session","state":"Shutdown"},
+  {"udid":"81222222-2222-2222-2222-222222222223","name":"Default Session","state":"Shutdown"}
+]}}
+JSON
+
+  run_cli run --project family-foqos --agent build2 --session default \
+    --udid 81222222-2222-2222-2222-222222222223 -- \
+    "$ENV_HELPER" "$environment_file" 0
+
+  assert_equal "explicit default session run succeeds" "0" "$COMMAND_STATUS"
+  assert_equal "explicit session is exported" "default" \
+    "$(sed -n 's/^IOS_SIM_GATE_SESSION=//p' "$environment_file")"
+  assert_equal "explicit session is marked set" "x" \
+    "$(sed -n 's/^IOS_SIM_GATE_SESSION_IS_SET=//p' "$environment_file")"
+  assert_equal "explicit default gets distinct DerivedData path" \
+    "$IOS_SIM_GATE_CACHE_HOME/DerivedData/family-foqos/build2/session-default" \
+    "$(sed -n 's/^IOS_SIM_GATE_DERIVED_DATA_PATH=//p' "$environment_file")"
+}
+
+test_run_refreshes_stale_entry_before_waiting_for_uuid() {
+  setup_test
+  local uuid="81333333-3333-3333-3333-333333333333"
+  export IOS_SIM_GATE_NOW="2026-08-10T06:00:00Z"
+  register_uuid "$uuid" build2
+  cat >"$IOS_SIM_GATE_SIMCTL_DEVICES" <<JSON
+{"devices":{"runtime":[{"udid":"$uuid","name":"Early Refresh","state":"Shutdown"}]}}
+JSON
+  "$HOLD_LOCK_HELPER" "$IOS_SIM_GATE_HOME/locks/simulators/$uuid.lock" \
+    "$TEST_ROOT/refresh-lock-ready" "$TEST_ROOT/refresh-lock-release" &
+  local lock_pid=$!
+  wait_for_file "$TEST_ROOT/refresh-lock-ready"
+  export IOS_SIM_GATE_NOW="2026-08-10T09:00:00Z"
+
+  IOS_SIM_GATE_WAIT_SECONDS=0 run_cli run --project family-foqos --agent build2 \
+    --udid "$uuid" -- /usr/bin/true
+
+  assert_equal "UUID wait still times out" "1" "$COMMAND_STATUS"
+  assert_equal "run refreshes owner before UUID wait" "2026-08-10T09:00:00Z" \
+    "$(registry_value ".[\"$uuid\"].lastupdated")"
+  touch "$TEST_ROOT/refresh-lock-release"
+  wait "$lock_pid"
 }
 
 test_run_rejects_registry_owner_mismatch() {
@@ -351,6 +405,12 @@ JSON
   IOS_SIM_GATE_CAP=4 run_cli status
   assert_equal "cap above three is rejected" "1" "$COMMAND_STATUS"
   assert_contains "cap rejection explains range" "between 1 and 3" "$COMMAND_OUTPUT"
+
+  IOS_SIM_GATE_CAP=1 run_cli status
+  assert_equal "lowered-cap status succeeds" "0" "$COMMAND_STATUS"
+  assert_contains "lowered-cap status reports one slot" "capacity slots=1" "$COMMAND_OUTPUT"
+  assert_not_contains "lowered-cap status hides disabled slot two" "slot=2" "$COMMAND_OUTPUT"
+  assert_not_contains "lowered-cap status hides disabled slot three" "slot=3" "$COMMAND_OUTPUT"
 }
 
 test_descendant_inherits_uuid_and_slot_locks() {
@@ -417,14 +477,55 @@ JSON
   done
 }
 
+test_refresh_registry_wait_uses_remaining_budget() {
+  setup_test
+  local uuid="88888888-8888-8888-8888-888888888888"
+  register_uuid "$uuid" build2
+  cat >"$IOS_SIM_GATE_SIMCTL_DEVICES" <<JSON
+{"devices":{"runtime":[{"udid":"$uuid","name":"Budgeted Wait","state":"Shutdown"}]}}
+JSON
+  "$HOLD_LOCK_HELPER" "$IOS_SIM_GATE_HOME/locks/simulators/$uuid.lock" \
+    "$TEST_ROOT/budget-uuid-ready" "$TEST_ROOT/budget-uuid-release" &
+  local uuid_lock_pid=$!
+  wait_for_file "$TEST_ROOT/budget-uuid-ready"
+
+  (
+    set +e
+    IOS_SIM_GATE_WAIT_SECONDS=3 "$CLI" run --project family-foqos --agent build2 \
+      --udid "$uuid" -- /usr/bin/true >"$TEST_ROOT/budget-run.log" 2>&1
+    printf '%s\n' "$?" >"$TEST_ROOT/budget-run-status"
+  ) &
+  local run_pid=$!
+  sleep 1.1
+  "$HOLD_LOCK_HELPER" "$IOS_SIM_GATE_HOME/locks/registry.lock" \
+    "$TEST_ROOT/budget-registry-ready" "$TEST_ROOT/budget-registry-release" &
+  local registry_lock_pid=$!
+  wait_for_file "$TEST_ROOT/budget-registry-ready"
+  touch "$TEST_ROOT/budget-uuid-release"
+  wait "$uuid_lock_pid"
+  wait "$run_pid"
+
+  assert_equal "refresh registry wait times out" "1" \
+    "$(tr -d '\n' <"$TEST_ROOT/budget-run-status")"
+  assert_contains "refresh timeout names registry lock" "waiting for registry lock" \
+    "$(cat "$TEST_ROOT/budget-run.log")"
+  assert_not_contains "refresh registry wait does not restart full budget" \
+    "after 3s waiting for registry lock" "$(cat "$TEST_ROOT/budget-run.log")"
+  touch "$TEST_ROOT/budget-registry-release"
+  wait "$registry_lock_pid"
+}
+
 run_run_tests() {
   test_run_exports_environment_and_preserves_exit_status
+  test_run_distinguishes_explicit_default_session
+  test_run_refreshes_stale_entry_before_waiting_for_uuid
   test_run_rejects_registry_owner_mismatch
   test_same_uuid_runs_serialize
   test_global_cap_allows_three_and_times_out_fourth
   test_operator_can_lower_but_not_raise_cap
   test_descendant_inherits_uuid_and_slot_locks
   test_waiter_rotates_when_a_different_slot_frees
+  test_refresh_registry_wait_uses_remaining_budget
 }
 
 write_cleanup_inventory() {
@@ -521,9 +622,25 @@ test_status_reports_registry_inventory_and_process_reality() {
     "$COMMAND_OUTPUT"
 }
 
+test_cleanup_removes_inventory_temps_when_simctl_data_is_invalid() {
+  setup_test
+  printf 'not-json\n' >"$IOS_SIM_GATE_SIMCTL_TESTING_DEVICES"
+
+  run_cli cleanup
+
+  assert_equal "invalid simctl inventory fails cleanup" "1" "$COMMAND_STATUS"
+  assert_contains "invalid inventory explains failure" \
+    "simctl returned an invalid device inventory" "$COMMAND_OUTPUT"
+  local leftovers
+  leftovers="$(find "$IOS_SIM_GATE_HOME" -maxdepth 1 -type f \
+    \( -name '.devices.*' -o -name '.testing-devices.*' -o -name '.registry.*' \) -print)"
+  assert_equal "failed cleanup removes tracked temp files" "" "$leftovers"
+}
+
 run_cleanup_tests() {
   test_cleanup_respects_registry_locks_and_testing_set
   test_status_reports_registry_inventory_and_process_reality
+  test_cleanup_removes_inventory_temps_when_simctl_data_is_invalid
 }
 
 run_installer() {

@@ -13,6 +13,38 @@ SIMCTL_BIN="${IOS_SIM_GATE_SIMCTL_BIN:-}"
 STALE_SECONDS="${IOS_SIM_GATE_STALE_SECONDS:-604800}"
 CAP="${IOS_SIM_GATE_CAP:-3}"
 SLOT_SLICE_SECONDS="${IOS_SIM_GATE_SLOT_SLICE_SECONDS:-2}"
+TEMP_PATHS=()
+TEMP_OWNER_PID="$BASHPID"
+
+track_temp() {
+  TEMP_PATHS+=("$1")
+}
+
+untrack_temp() {
+  local target="$1"
+  local path
+  local kept_paths=()
+
+  for path in "${TEMP_PATHS[@]}"; do
+    [ "$path" = "$target" ] || kept_paths+=("$path")
+  done
+  TEMP_PATHS=("${kept_paths[@]}")
+}
+
+cleanup_temp_paths() {
+  local path
+
+  [ "$BASHPID" -eq "$TEMP_OWNER_PID" ] || return
+  for path in "${TEMP_PATHS[@]}"; do
+    case "$path" in
+      "$STATE_ROOT"/.registry.*|"$STATE_ROOT"/.devices.*|"$STATE_ROOT"/.testing-devices.*)
+        rm -f -- "$path"
+        ;;
+    esac
+  done
+}
+
+trap cleanup_temp_paths EXIT
 
 die() {
   printf 'ios-sim-gate: %s\n' "$1" >&2
@@ -114,17 +146,18 @@ ensure_state() {
 }
 
 acquire_registry_lock() {
+  local wait_seconds="${1:-$WAIT_SECONDS}"
   local flock_rc=0
 
   exec 6>>"$LOCK_ROOT/registry.lock"
-  if [ "$WAIT_SECONDS" -eq 0 ]; then
+  if [ "$wait_seconds" -eq 0 ]; then
     "$FLOCK_BIN" -n -x 6 || flock_rc=$?
   else
-    "$FLOCK_BIN" -x -w "$WAIT_SECONDS" 6 || flock_rc=$?
+    "$FLOCK_BIN" -x -w "$wait_seconds" 6 || flock_rc=$?
   fi
   case "$flock_rc" in
     0) ;;
-    1) die "timed out after ${WAIT_SECONDS}s waiting for registry lock" ;;
+    1) die "timed out after ${wait_seconds}s waiting for registry lock" ;;
     *) die "could not acquire registry lock (flock status $flock_rc)" ;;
   esac
 }
@@ -178,14 +211,17 @@ write_registry_entry() {
        (if $session == "" then {} else {session: $session} end)'
   )"
   temporary="$(mktemp "$STATE_ROOT/.registry.XXXXXX")"
+  track_temp "$temporary"
   # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
   if ! "$JQ_BIN" --arg uuid "$uuid" --argjson entry "$entry" \
     '.[$uuid] = $entry' "$REGISTRY" >"$temporary"; then
     rm -f "$temporary"
+    untrack_temp "$temporary"
     die "could not update registry"
   fi
   chmod 600 "$temporary"
   mv "$temporary" "$REGISTRY"
+  untrack_temp "$temporary"
 }
 
 remove_registry_entry() {
@@ -193,13 +229,16 @@ remove_registry_entry() {
   local temporary
 
   temporary="$(mktemp "$STATE_ROOT/.registry.XXXXXX")"
+  track_temp "$temporary"
   # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
   if ! "$JQ_BIN" --arg uuid "$uuid" 'del(.[$uuid])' "$REGISTRY" >"$temporary"; then
     rm -f "$temporary"
+    untrack_temp "$temporary"
     die "could not update registry"
   fi
   chmod 600 "$temporary"
   mv "$temporary" "$REGISTRY"
+  untrack_temp "$temporary"
 }
 
 load_inventory() {
@@ -260,6 +299,8 @@ cleanup_locked() {
 
   normal_inventory="$(mktemp "$STATE_ROOT/.devices.XXXXXX")"
   testing_inventory="$(mktemp "$STATE_ROOT/.testing-devices.XXXXXX")"
+  track_temp "$normal_inventory"
+  track_temp "$testing_inventory"
   load_inventory "$normal_inventory" list devices --json
   load_inventory "$testing_inventory" --set testing list devices --json
   now_epoch="$(timestamp_epoch "$(now_utc)")"
@@ -339,6 +380,8 @@ cleanup_locked() {
   done < <("$JQ_BIN" -r 'keys[]' "$REGISTRY")
 
   rm -f "$normal_inventory" "$testing_inventory"
+  untrack_temp "$normal_inventory"
+  untrack_temp "$testing_inventory"
 }
 
 cleanup_command() {
@@ -389,11 +432,13 @@ status_command() {
   validate_registry
   normal_inventory="$(mktemp "$STATE_ROOT/.devices.XXXXXX")"
   testing_inventory="$(mktemp "$STATE_ROOT/.testing-devices.XXXXXX")"
+  track_temp "$normal_inventory"
+  track_temp "$testing_inventory"
   load_inventory "$normal_inventory" list devices --json
   load_inventory "$testing_inventory" --set testing list devices --json
 
   printf 'capacity slots=%s admission=%s\n' "$CAP" "$(lock_status "$LOCK_ROOT/admission.lock")"
-  for uuid in 1 2 3; do
+  for ((uuid = 1; uuid <= CAP; uuid++)); do
     printf 'slot=%s lock=%s\n' "$uuid" "$(lock_status "$LOCK_ROOT/slots/$uuid.lock")"
   done
   while IFS=$'\t' read -r uuid name state bytes; do
@@ -428,6 +473,8 @@ status_command() {
   done < <("$JQ_BIN" -r 'keys[]' "$REGISTRY")
 
   rm -f "$normal_inventory" "$testing_inventory"
+  untrack_temp "$normal_inventory"
+  untrack_temp "$testing_inventory"
   exec 6>&-
 }
 
@@ -623,7 +670,7 @@ acquire_global_slot() {
 }
 
 refresh_run_owner() {
-  acquire_registry_lock
+  acquire_registry_lock "$(remaining_wait_seconds)"
   ensure_registry_exists
   validate_registry
   cleanup_locked
@@ -634,19 +681,21 @@ refresh_run_owner() {
 
 run_command() {
   local derived_data_path
+  local derived_data_session
 
   parse_run_arguments "$@"
   ensure_state
   require_simctl
   validate_stale_seconds
+  RUN_STARTED_AT=$SECONDS
 
-  acquire_registry_lock
+  acquire_registry_lock "$(remaining_wait_seconds)"
   ensure_registry_exists
   validate_registry
   validate_run_owner
+  write_registry_entry "$RUN_UUID" "$RUN_PROJECT" "$RUN_AGENT" "$RUN_SESSION" "$(now_utc)"
   exec 6>&-
 
-  RUN_STARTED_AT=$SECONDS
   exec 8>>"$LOCK_ROOT/simulators/$RUN_UUID.lock"
   acquire_run_lock "simulator $RUN_UUID" -x 8
   exec 7>>"$LOCK_ROOT/admission.lock"
@@ -654,14 +703,23 @@ run_command() {
   acquire_global_slot
   refresh_run_owner
 
-  derived_data_path="$CACHE_ROOT/DerivedData/$RUN_PROJECT/$RUN_AGENT/${RUN_SESSION:-default}"
+  if [ -n "$RUN_SESSION" ]; then
+    derived_data_session="session-$RUN_SESSION"
+  else
+    derived_data_session="no-session"
+  fi
+  derived_data_path="$CACHE_ROOT/DerivedData/$RUN_PROJECT/$RUN_AGENT/$derived_data_session"
   mkdir -p "$derived_data_path"
   export IOS_SIM_GATE_UDID="$RUN_UUID"
   export IOS_SIM_GATE_DESTINATION="platform=iOS Simulator,id=$RUN_UUID"
   export IOS_SIM_GATE_DERIVED_DATA_PATH="$derived_data_path"
   export IOS_SIM_GATE_PROJECT="$RUN_PROJECT"
   export IOS_SIM_GATE_AGENT="$RUN_AGENT"
-  export IOS_SIM_GATE_SESSION="$RUN_SESSION"
+  if [ -n "$RUN_SESSION" ]; then
+    export IOS_SIM_GATE_SESSION="$RUN_SESSION"
+  else
+    unset IOS_SIM_GATE_SESSION
+  fi
 
   exec "${RUN_COMMAND[@]}"
 }
