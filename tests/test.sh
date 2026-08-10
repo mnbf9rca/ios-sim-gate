@@ -49,6 +49,16 @@ assert_contains() {
   esac
 }
 
+assert_not_contains() {
+  local name="$1"
+  local needle="$2"
+  local haystack="$3"
+  case "$haystack" in
+    *"$needle"*) fail "$name" "expected output not to contain '$needle'; output: $haystack" ;;
+    *) pass "$name" ;;
+  esac
+}
+
 setup_test() {
   [ -z "$TEST_ROOT" ] || rm -rf "$TEST_ROOT"
   TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ios-sim-gate-test.XXXXXX")"
@@ -363,6 +373,50 @@ JSON
   touch "$TEST_ROOT/descendant-release"
 }
 
+test_waiter_rotates_when_a_different_slot_frees() {
+  setup_test
+  local uuid="87777777-7777-7777-7777-777777777777"
+  local checksum
+  local first_slot
+  local released_slot
+  local slot
+  local holder_pids=""
+  register_uuid "$uuid" build2
+  cat >"$IOS_SIM_GATE_SIMCTL_DEVICES" <<JSON
+{"devices":{"runtime":[{"udid":"$uuid","name":"Rotating Waiter","state":"Shutdown"}]}}
+JSON
+  checksum="$(printf '%s' "$uuid" | cksum)"
+  checksum="${checksum%% *}"
+  first_slot=$((checksum % 3 + 1))
+  released_slot=$((first_slot % 3 + 1))
+
+  for slot in 1 2 3; do
+    "$HOLD_LOCK_HELPER" "$IOS_SIM_GATE_HOME/locks/slots/$slot.lock" \
+      "$TEST_ROOT/slot-ready-$slot" "$TEST_ROOT/slot-release-$slot" &
+    holder_pids="$holder_pids $!"
+    wait_for_file "$TEST_ROOT/slot-ready-$slot"
+  done
+
+  IOS_SIM_GATE_WAIT_SECONDS=8 IOS_SIM_GATE_SLOT_SLICE_SECONDS=1 \
+    "$CLI" run --project family-foqos --agent build2 --udid "$uuid" -- \
+      /usr/bin/touch "$TEST_ROOT/rotated-start" >"$TEST_ROOT/rotated.log" 2>&1 &
+  local waiter_pid=$!
+  sleep 0.15
+  touch "$TEST_ROOT/slot-release-$released_slot"
+  if wait_for_file "$TEST_ROOT/rotated-start"; then
+    pass "waiter rotates to a different freed slot"
+  else
+    fail "waiter rotates to a different freed slot" \
+      "waiter remained pinned to slot $first_slot after slot $released_slot was freed"
+  fi
+
+  touch "$TEST_ROOT/slot-release-1" "$TEST_ROOT/slot-release-2" "$TEST_ROOT/slot-release-3"
+  wait "$waiter_pid"
+  for slot in $holder_pids; do
+    wait "$slot"
+  done
+}
+
 run_run_tests() {
   test_run_exports_environment_and_preserves_exit_status
   test_run_rejects_registry_owner_mismatch
@@ -370,6 +424,7 @@ run_run_tests() {
   test_global_cap_allows_three_and_times_out_fourth
   test_operator_can_lower_but_not_raise_cap
   test_descendant_inherits_uuid_and_slot_locks
+  test_waiter_rotates_when_a_different_slot_frees
 }
 
 write_cleanup_inventory() {
@@ -430,9 +485,11 @@ test_cleanup_respects_registry_locks_and_testing_set() {
   assert_contains "cleanup deletes exact stale UUID" \
     "delete 91111111-1111-1111-1111-111111111111" \
     "$(cat "$IOS_SIM_GATE_SIMCTL_LOG")"
-  assert_contains "cleanup deletes exact unregistered UUID" \
-    "delete 94444444-4444-4444-4444-444444444444" \
+  assert_not_contains "cleanup never deletes unregistered normal UUID" \
+    "94444444-4444-4444-4444-444444444444" \
     "$(cat "$IOS_SIM_GATE_SIMCTL_LOG")"
+  assert_not_contains "cleanup does not clutter output with unregistered normal UUID" \
+    "94444444-4444-4444-4444-444444444444" "$COMMAND_OUTPUT"
   case "$(cat "$IOS_SIM_GATE_SIMCTL_LOG")" in
     *95555555-5555-5555-5555-555555555555*)
       fail "cleanup never deletes testing fixture" "testing UUID reached destructive simctl" ;;

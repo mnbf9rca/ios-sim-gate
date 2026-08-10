@@ -12,6 +12,7 @@ CACHE_ROOT="${IOS_SIM_GATE_CACHE_HOME:-$HOME/Library/Caches/ios-sim-gate}"
 SIMCTL_BIN="${IOS_SIM_GATE_SIMCTL_BIN:-}"
 STALE_SECONDS="${IOS_SIM_GATE_STALE_SECONDS:-604800}"
 CAP="${IOS_SIM_GATE_CAP:-3}"
+SLOT_SLICE_SECONDS="${IOS_SIM_GATE_SLOT_SLICE_SECONDS:-2}"
 
 die() {
   printf 'ios-sim-gate: %s\n' "$1" >&2
@@ -53,6 +54,13 @@ validate_capacity() {
   case "$CAP" in
     1|2|3) ;;
     *) die "IOS_SIM_GATE_CAP must be between 1 and 3" ;;
+  esac
+}
+
+validate_slot_slice_seconds() {
+  case "$SLOT_SLICE_SECONDS" in
+    [1-9]|[1-9][0-9]*) ;;
+    *) die "IOS_SIM_GATE_SLOT_SLICE_SECONDS must be a positive integer" ;;
   esac
 }
 
@@ -264,13 +272,12 @@ cleanup_locked() {
          [.[$uuid].project, .[$uuid].agent, (.[$uuid].session // "default")] | join("/")
        else "" end' "$REGISTRY")"
 
-    if [ -n "$owner" ]; then
-      # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
-      updated="$("$JQ_BIN" -r --arg uuid "$uuid" '.[$uuid].lastupdated' "$REGISTRY")"
-      updated_epoch="$(timestamp_epoch "$updated")"
-      if [ $((now_epoch - updated_epoch)) -le "$STALE_SECONDS" ]; then
-        continue
-      fi
+    [ -n "$owner" ] || continue
+    # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+    updated="$("$JQ_BIN" -r --arg uuid "$uuid" '.[$uuid].lastupdated' "$REGISTRY")"
+    updated_epoch="$(timestamp_epoch "$updated")"
+    if [ $((now_epoch - updated_epoch)) -le "$STALE_SECONDS" ]; then
+      continue
     fi
 
     if ! try_uuid_lock "$uuid"; then
@@ -280,28 +287,22 @@ cleanup_locked() {
     fi
 
     validate_registry
-    if [ -n "$owner" ]; then
-      # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
-      updated="$("$JQ_BIN" -r --arg uuid "$uuid" '.[$uuid].lastupdated // ""' "$REGISTRY")"
-      if [ -z "$updated" ]; then
-        exec 5>&-
-        continue
-      fi
-      updated_epoch="$(timestamp_epoch "$updated")"
-      if [ $((now_epoch - updated_epoch)) -le "$STALE_SECONDS" ]; then
-        exec 5>&-
-        continue
-      fi
-    elif "$JQ_BIN" -e --arg uuid "$uuid" "has(\$uuid)" "$REGISTRY" >/dev/null; then
+    # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+    updated="$("$JQ_BIN" -r --arg uuid "$uuid" '.[$uuid].lastupdated // ""' "$REGISTRY")"
+    if [ -z "$updated" ]; then
+      exec 5>&-
+      continue
+    fi
+    updated_epoch="$(timestamp_epoch "$updated")"
+    if [ $((now_epoch - updated_epoch)) -le "$STALE_SECONDS" ]; then
       exec 5>&-
       continue
     fi
 
     if delete_simulator_locked "$uuid"; then
       printf 'cleanup delete uuid=%s owner=%s name=%s reason=%s bytes=%s\n' \
-        "$uuid" "${owner:-unregistered}" "$name" \
-        "$([ -n "$owner" ] && printf stale || printf unregistered)" "$bytes" >&2
-      [ -z "$owner" ] || remove_registry_entry "$uuid"
+        "$uuid" "$owner" "$name" stale "$bytes" >&2
+      remove_registry_entry "$uuid"
     else
       printf 'cleanup error uuid=%s reason=simctl-delete-failed\n' "$uuid" >&2
     fi
@@ -576,6 +577,8 @@ acquire_run_lock() {
 acquire_global_slot() {
   local checksum
   local offset
+  local remaining
+  local slice
   local slot
   local flock_rc
 
@@ -594,11 +597,29 @@ acquire_global_slot() {
     exec 9>&-
   done
 
-  slot=$((checksum % CAP + 1))
-  exec 9>>"$LOCK_ROOT/slots/$slot.lock"
-  acquire_run_lock "global simulator slot" -x 9
-  IOS_SIM_GATE_SLOT="$slot"
-  export IOS_SIM_GATE_SLOT
+  while true; do
+    for ((offset = 0; offset < CAP; offset++)); do
+      remaining="$(remaining_wait_seconds)"
+      [ "$remaining" -gt 0 ] ||
+        die "timed out after ${WAIT_SECONDS}s waiting for global simulator slot"
+      slice="$SLOT_SLICE_SECONDS"
+      if [ "$slice" -gt "$remaining" ]; then
+        slice="$remaining"
+      fi
+      slot=$(((checksum + offset) % CAP + 1))
+      exec 9>>"$LOCK_ROOT/slots/$slot.lock"
+      flock_rc=0
+      "$FLOCK_BIN" -x -w "$slice" 9 || flock_rc=$?
+      if [ "$flock_rc" -eq 0 ]; then
+        IOS_SIM_GATE_SLOT="$slot"
+        export IOS_SIM_GATE_SLOT
+        return
+      fi
+      exec 9>&-
+      [ "$flock_rc" -eq 1 ] ||
+        die "could not acquire global simulator slot (flock status $flock_rc)"
+    done
+  done
 }
 
 refresh_run_owner() {
@@ -649,6 +670,7 @@ require_executable "$FLOCK_BIN"
 require_executable "$JQ_BIN"
 validate_wait_seconds
 validate_capacity
+validate_slot_slice_seconds
 
 case "${1:-}" in
   register) shift; register_simulator "$@" ;;

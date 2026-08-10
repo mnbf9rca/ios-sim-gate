@@ -72,9 +72,10 @@ IOS_SIM_GATE_CAP=1 ios-sim-gate run ...
 ```
 
 Waits are bounded by `IOS_SIM_GATE_WAIT_SECONDS` (default 1800 seconds). The implementation first
-scans the enabled slot locks once, without polling, then blocks in `flock` on a stable slot. Wake
-order is kernel-arbitrary, not FIFO. Strict FIFO would require ticket machinery and is deliberately
-omitted unless starvation is observed in practice.
+scans the enabled slot locks once, then rotates across them with short blocking `flock` waits. A
+freed slot is picked up within seconds without a tight polling loop. Wake order is
+kernel-arbitrary, not FIFO; strict FIFO would require ticket machinery and is deliberately omitted
+unless starvation is observed in practice.
 
 Lock descriptors are inherited by the adapter and its descendants. A surviving descendant keeps
 the UUID and global slot locked even if its parent exits. The adapter's exact exit status is returned.
@@ -85,7 +86,7 @@ An acquire runs a cleanup sweep while holding `registry.lock`. The default stale
 days and can be changed with `IOS_SIM_GATE_STALE_SECONDS`.
 
 - A stale registered simulator is shut down and deleted only while its UUID lock is free.
-- An unregistered normal-set simulator is deleted only while its UUID lock is free.
+- An unregistered normal-set simulator is never deleted or logged by cleanup.
 - A missing simulator's registry entry is pruned only while its UUID lock is free.
 - Every testing-set simulator is report-only. The tool never runs a blanket testing-set delete.
 - Every destructive `simctl` operation targets one validated UUID.

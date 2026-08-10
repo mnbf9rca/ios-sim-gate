@@ -14,7 +14,7 @@
 - State lives under `~/Library/Application Support/ios-sim-gate/`; lock files are stable and never replaced.
 - The registry is `{ UUID: { project, agent, lastupdated, session? } }`; `flock` alone determines liveness.
 - The global host cap is three with no project quotas.
-- Slot waiting uses one nonblocking availability scan followed by blocking `flock` on one selected slot; there is no polling loop and no FIFO guarantee.
+- Slot waiting uses one nonblocking availability scan followed by short blocking `flock` waits rotated across enabled slots; there is no tight polling loop and no FIFO guarantee.
 - The tool never creates, names, selects, or replaces simulators.
 - Cleanup never uses a blanket testing-device-set delete and skips anything not positively attributable.
 - Family Foqos adoption files are out of scope.
@@ -80,7 +80,7 @@ Expected: FAIL because `run` is not implemented.
 
 - [ ] **Step 3: Implement minimal gate behavior**
 
-Acquire the simulator lock, shared admission lock, and a global slot with inherited descriptors. Scan three slots once; when all are busy, choose a deterministic slot from `(project, agent, session)` and block in `flock` with the remaining timeout. Refresh `lastupdated`, export exact UUID/destination/DerivedData values, and `exec` the child.
+Acquire the simulator lock, shared admission lock, and a global slot with inherited descriptors. Scan three slots once; when all are busy, rotate through short bounded blocking `flock` waits until a slot frees or the overall timeout expires. Refresh `lastupdated`, export exact UUID/destination/DerivedData values, and `exec` the child.
 
 - [ ] **Step 4: Run tests and verify GREEN**
 
@@ -107,7 +107,7 @@ git commit -m "feat: add machine-wide run gate"
 
 - [ ] **Step 1: Write failing cleanup/status tests**
 
-Cover stale registered deletion, cleanup skipping a held UUID lock, absent-device registry pruning, positively attributed clone deletion when fake metadata supplies a registered parent UUID, unattributed clone reporting/skipping, corrupt registry failure, and status showing registry, simulator, lock, and process reality.
+Cover stale registered deletion, cleanup skipping a held UUID lock, absent-device registry pruning, unregistered normal-set non-deletion, testing-set reporting/skipping, corrupt registry failure, and status showing registry, simulator, lock, and process reality.
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -117,7 +117,7 @@ Expected: FAIL because cleanup/status are not implemented.
 
 - [ ] **Step 3: Implement minimal cleanup/status behavior**
 
-Parse default and testing device inventories through the injectable shim. Under `registry.lock`, acquire each candidate UUID lock nonblockingly before deletion. Delete stale registered devices and clones whose parent UUID is registered; skip locked or unattributed devices, never call `delete all`, and remove missing registry entries. Status combines registry data, simulator state, `flock` state, `lsof`, and `pgrep -f UUID` output.
+Parse default and testing device inventories through the injectable shim. Under `registry.lock`, acquire each candidate UUID lock nonblockingly before deletion. Delete only stale registered devices, skip locked or unregistered devices, never call `delete all`, and remove missing registry entries. Status combines registry data, simulator state, `flock` state, `lsof`, and `pgrep -f UUID` output.
 
 - [ ] **Step 4: Run tests and verify GREEN**
 
