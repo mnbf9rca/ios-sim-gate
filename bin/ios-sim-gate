@@ -9,6 +9,8 @@ FLOCK_BIN="${IOS_SIM_GATE_FLOCK_BIN:-/opt/homebrew/bin/flock}"
 JQ_BIN="${IOS_SIM_GATE_JQ_BIN:-/opt/homebrew/bin/jq}"
 WAIT_SECONDS="${IOS_SIM_GATE_WAIT_SECONDS:-1800}"
 CACHE_ROOT="${IOS_SIM_GATE_CACHE_HOME:-$HOME/Library/Caches/ios-sim-gate}"
+SIMCTL_BIN="${IOS_SIM_GATE_SIMCTL_BIN:-}"
+STALE_SECONDS="${IOS_SIM_GATE_STALE_SECONDS:-604800}"
 
 die() {
   printf 'ios-sim-gate: %s\n' "$1" >&2
@@ -22,6 +24,9 @@ ios-sim-gate — machine-wide Xcode simulator registry and run gate
 Usage:
   ios-sim-gate register --project NAME --agent NAME [--session NAME] --udid UUID
   ios-sim-gate run --project NAME --agent NAME [--session NAME] --udid UUID -- COMMAND [ARG ...]
+  ios-sim-gate status
+  ios-sim-gate cleanup
+  ios-sim-gate reconcile
 USAGE
 }
 
@@ -33,6 +38,13 @@ validate_wait_seconds() {
   case "$WAIT_SECONDS" in
     0|[1-9]|[1-9][0-9]*) ;;
     *) die "IOS_SIM_GATE_WAIT_SECONDS must be a canonical non-negative integer" ;;
+  esac
+}
+
+validate_stale_seconds() {
+  case "$STALE_SECONDS" in
+    0|[1-9]|[1-9][0-9]*) ;;
+    *) die "IOS_SIM_GATE_STALE_SECONDS must be a canonical non-negative integer" ;;
   esac
 }
 
@@ -53,6 +65,27 @@ now_utc() {
     printf '%s\n' "$IOS_SIM_GATE_NOW"
   else
     /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'
+  fi
+}
+
+timestamp_epoch() {
+  /bin/date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null ||
+    die "could not parse registry timestamp: $1"
+}
+
+simctl() {
+  if [ -n "$SIMCTL_BIN" ]; then
+    "$SIMCTL_BIN" "$@"
+  else
+    /usr/bin/xcrun simctl "$@"
+  fi
+}
+
+require_simctl() {
+  if [ -n "$SIMCTL_BIN" ]; then
+    require_executable "$SIMCTL_BIN"
+  else
+    require_executable /usr/bin/xcrun
   fi
 }
 
@@ -137,6 +170,256 @@ write_registry_entry() {
   fi
   chmod 600 "$temporary"
   mv "$temporary" "$REGISTRY"
+}
+
+remove_registry_entry() {
+  local uuid="$1"
+  local temporary
+
+  temporary="$(mktemp "$STATE_ROOT/.registry.XXXXXX")"
+  # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+  if ! "$JQ_BIN" --arg uuid "$uuid" 'del(.[$uuid])' "$REGISTRY" >"$temporary"; then
+    rm -f "$temporary"
+    die "could not update registry"
+  fi
+  chmod 600 "$temporary"
+  mv "$temporary" "$REGISTRY"
+}
+
+load_inventory() {
+  local target="$1"
+  shift
+
+  if ! simctl "$@" >"$target"; then
+    die "simctl inventory failed: $*"
+  fi
+  # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+  "$JQ_BIN" -e '
+    .devices | type == "object" and
+    all(.[]; type == "array" and all(.[]; (.udid | type == "string")))
+  ' "$target" >/dev/null 2>&1 || die "simctl returned an invalid device inventory"
+}
+
+inventory_rows() {
+  # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+  "$JQ_BIN" -r '
+    .devices[]?[]? |
+    [.udid, (.name // "unknown"), (.state // "unknown"), (.dataPathSize // 0)] | @tsv
+  ' "$1"
+}
+
+inventory_has_uuid() {
+  local inventory="$1"
+  local uuid="$2"
+  # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+  "$JQ_BIN" -e --arg uuid "$uuid" \
+    'any(.devices[]?[]?; .udid == $uuid)' "$inventory" >/dev/null
+}
+
+try_uuid_lock() {
+  local uuid="$1"
+  exec 5>>"$LOCK_ROOT/simulators/$uuid.lock"
+  "$FLOCK_BIN" -n -x 5
+}
+
+delete_simulator_locked() {
+  local uuid="$1"
+
+  validate_uuid "$uuid"
+  simctl shutdown "$uuid" >/dev/null 2>&1 || true
+  simctl delete "$uuid" >/dev/null
+}
+
+cleanup_locked() {
+  local normal_inventory
+  local testing_inventory
+  local uuid
+  local name
+  local state
+  local bytes
+  local owner
+  local updated
+  local now_epoch
+  local updated_epoch
+
+  normal_inventory="$(mktemp "$STATE_ROOT/.devices.XXXXXX")"
+  testing_inventory="$(mktemp "$STATE_ROOT/.testing-devices.XXXXXX")"
+  load_inventory "$normal_inventory" list devices --json
+  load_inventory "$testing_inventory" --set testing list devices --json
+  now_epoch="$(timestamp_epoch "$(now_utc)")"
+
+  while IFS=$'\t' read -r uuid name state bytes; do
+    validate_uuid "$uuid"
+    # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+    owner="$("$JQ_BIN" -r --arg uuid "$uuid" \
+      'if has($uuid) then
+         [.[$uuid].project, .[$uuid].agent, (.[$uuid].session // "default")] | join("/")
+       else "" end' "$REGISTRY")"
+
+    if [ -n "$owner" ]; then
+      # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+      updated="$("$JQ_BIN" -r --arg uuid "$uuid" '.[$uuid].lastupdated' "$REGISTRY")"
+      updated_epoch="$(timestamp_epoch "$updated")"
+      if [ $((now_epoch - updated_epoch)) -le "$STALE_SECONDS" ]; then
+        continue
+      fi
+    fi
+
+    if ! try_uuid_lock "$uuid"; then
+      printf 'cleanup skip uuid=%s reason=locked\n' "$uuid" >&2
+      exec 5>&-
+      continue
+    fi
+
+    validate_registry
+    if [ -n "$owner" ]; then
+      # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+      updated="$("$JQ_BIN" -r --arg uuid "$uuid" '.[$uuid].lastupdated // ""' "$REGISTRY")"
+      if [ -z "$updated" ]; then
+        exec 5>&-
+        continue
+      fi
+      updated_epoch="$(timestamp_epoch "$updated")"
+      if [ $((now_epoch - updated_epoch)) -le "$STALE_SECONDS" ]; then
+        exec 5>&-
+        continue
+      fi
+    elif "$JQ_BIN" -e --arg uuid "$uuid" "has(\$uuid)" "$REGISTRY" >/dev/null; then
+      exec 5>&-
+      continue
+    fi
+
+    if delete_simulator_locked "$uuid"; then
+      printf 'cleanup delete uuid=%s owner=%s name=%s reason=%s bytes=%s\n' \
+        "$uuid" "${owner:-unregistered}" "$name" \
+        "$([ -n "$owner" ] && printf stale || printf unregistered)" "$bytes" >&2
+      [ -z "$owner" ] || remove_registry_entry "$uuid"
+    else
+      printf 'cleanup error uuid=%s reason=simctl-delete-failed\n' "$uuid" >&2
+    fi
+    exec 5>&-
+  done < <(inventory_rows "$normal_inventory")
+
+  while IFS=$'\t' read -r uuid name state bytes; do
+    printf 'cleanup skip uuid=%s name=%s state=%s bytes=%s reason=testing-set-report-only\n' \
+      "$uuid" "$name" "$state" "$bytes" >&2
+  done < <(inventory_rows "$testing_inventory")
+
+  while IFS= read -r uuid; do
+    if inventory_has_uuid "$normal_inventory" "$uuid" ||
+       inventory_has_uuid "$testing_inventory" "$uuid"; then
+      continue
+    fi
+    if ! try_uuid_lock "$uuid"; then
+      printf 'cleanup skip uuid=%s reason=locked\n' "$uuid" >&2
+      exec 5>&-
+      continue
+    fi
+    validate_registry
+    if ! inventory_has_uuid "$normal_inventory" "$uuid" &&
+       ! inventory_has_uuid "$testing_inventory" "$uuid"; then
+      # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+      owner="$("$JQ_BIN" -r --arg uuid "$uuid" \
+        '[.[$uuid].project, .[$uuid].agent, (.[$uuid].session // "default")] | join("/")' \
+        "$REGISTRY")"
+      remove_registry_entry "$uuid"
+      printf 'cleanup prune uuid=%s owner=%s reason=simulator-missing bytes=0\n' \
+        "$uuid" "$owner" >&2
+    fi
+    exec 5>&-
+  done < <("$JQ_BIN" -r 'keys[]' "$REGISTRY")
+
+  rm -f "$normal_inventory" "$testing_inventory"
+}
+
+cleanup_command() {
+  [ "$#" -eq 0 ] || die "cleanup takes no arguments"
+  ensure_state
+  require_simctl
+  validate_stale_seconds
+  acquire_registry_lock
+  ensure_registry_exists
+  validate_registry
+  cleanup_locked
+  exec 6>&-
+}
+
+lock_status() {
+  local lock_path="$1"
+  local pids=""
+
+  exec 5>>"$lock_path"
+  if "$FLOCK_BIN" -n -x 5; then
+    exec 5>&-
+    printf 'free'
+    return
+  fi
+  exec 5>&-
+  if [ -x /usr/sbin/lsof ]; then
+    pids="$(/usr/sbin/lsof -t "$lock_path" 2>/dev/null | sort -u | paste -sd, -)"
+  fi
+  printf 'held%s' "${pids:+ pids=$pids}"
+}
+
+status_command() {
+  local normal_inventory
+  local testing_inventory
+  local uuid
+  local name
+  local state
+  local bytes
+  local owner
+  local lock
+  local pid
+
+  [ "$#" -eq 0 ] || die "status takes no arguments"
+  ensure_state
+  require_simctl
+  acquire_registry_lock
+  ensure_registry_exists
+  validate_registry
+  normal_inventory="$(mktemp "$STATE_ROOT/.devices.XXXXXX")"
+  testing_inventory="$(mktemp "$STATE_ROOT/.testing-devices.XXXXXX")"
+  load_inventory "$normal_inventory" list devices --json
+  load_inventory "$testing_inventory" --set testing list devices --json
+
+  printf 'capacity slots=3 admission=%s\n' "$(lock_status "$LOCK_ROOT/admission.lock")"
+  for uuid in 1 2 3; do
+    printf 'slot=%s lock=%s\n' "$uuid" "$(lock_status "$LOCK_ROOT/slots/$uuid.lock")"
+  done
+  while IFS=$'\t' read -r uuid name state bytes; do
+    # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+    owner="$("$JQ_BIN" -r --arg uuid "$uuid" \
+      'if has($uuid) then
+         [.[$uuid].project, .[$uuid].agent, (.[$uuid].session // "default")] | join("/")
+       else "unregistered" end' "$REGISTRY")"
+    lock="$(lock_status "$LOCK_ROOT/simulators/$uuid.lock")"
+    printf 'uuid=%s owner=%s name=%s state=%s bytes=%s lock=%s\n' \
+      "$uuid" "$owner" "$name" "$state" "$bytes" "$lock"
+    while IFS= read -r pid; do
+      [ -n "$pid" ] || continue
+      printf '  process '
+      /bin/ps -p "$pid" -o pid=,ppid=,command= 2>/dev/null || printf 'pid=%s\n' "$pid"
+    done < <(/usr/bin/pgrep -f "$uuid" 2>/dev/null || true)
+  done < <(inventory_rows "$normal_inventory")
+  while IFS=$'\t' read -r uuid name state bytes; do
+    printf 'uuid=%s owner=testing-set-report-only name=%s state=%s bytes=%s lock=%s\n' \
+      "$uuid" "$name" "$state" "$bytes" "$(lock_status "$LOCK_ROOT/simulators/$uuid.lock")"
+  done < <(inventory_rows "$testing_inventory")
+  while IFS= read -r uuid; do
+    if ! inventory_has_uuid "$normal_inventory" "$uuid" &&
+       ! inventory_has_uuid "$testing_inventory" "$uuid"; then
+      # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+      owner="$("$JQ_BIN" -r --arg uuid "$uuid" \
+        '[.[$uuid].project, .[$uuid].agent, (.[$uuid].session // "default")] | join("/")' \
+        "$REGISTRY")"
+      printf 'uuid=%s owner=%s state=missing lock=%s\n' \
+        "$uuid" "$owner" "$(lock_status "$LOCK_ROOT/simulators/$uuid.lock")"
+    fi
+  done < <("$JQ_BIN" -r 'keys[]' "$REGISTRY")
+
+  rm -f "$normal_inventory" "$testing_inventory"
+  exec 6>&-
 }
 
 register_simulator() {
@@ -314,6 +597,7 @@ refresh_run_owner() {
   acquire_registry_lock
   ensure_registry_exists
   validate_registry
+  cleanup_locked
   validate_run_owner
   write_registry_entry "$RUN_UUID" "$RUN_PROJECT" "$RUN_AGENT" "$RUN_SESSION" "$(now_utc)"
   exec 6>&-
@@ -324,6 +608,8 @@ run_command() {
 
   parse_run_arguments "$@"
   ensure_state
+  require_simctl
+  validate_stale_seconds
 
   acquire_registry_lock
   ensure_registry_exists
@@ -358,6 +644,8 @@ validate_wait_seconds
 case "${1:-}" in
   register) shift; register_simulator "$@" ;;
   run) shift; run_command "$@" ;;
+  status) shift; status_command "$@" ;;
+  cleanup|reconcile) shift; cleanup_command "$@" ;;
   -h|--help) usage ;;
   "") usage >&2; exit 1 ;;
   *) die "unknown command: $1" ;;

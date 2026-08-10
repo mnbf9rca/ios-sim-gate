@@ -6,6 +6,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLI="$ROOT/bin/ios-sim-gate"
 ENV_HELPER="$ROOT/tests/helpers/child-env.sh"
 HOLD_HELPER="$ROOT/tests/helpers/hold.sh"
+HOLD_LOCK_HELPER="$ROOT/tests/helpers/hold-lock.sh"
+FAKE_SIMCTL="$ROOT/tests/helpers/fake-simctl.sh"
 JQ_BIN="${IOS_SIM_GATE_TEST_JQ_BIN:-/opt/homebrew/bin/jq}"
 GROUP="${1:-all}"
 PASS_COUNT=0
@@ -53,6 +55,13 @@ setup_test() {
   export IOS_SIM_GATE_JQ_BIN="$JQ_BIN"
   export IOS_SIM_GATE_CACHE_HOME="$TEST_ROOT/cache"
   export IOS_SIM_GATE_WAIT_SECONDS=2
+  export IOS_SIM_GATE_SIMCTL_BIN="$FAKE_SIMCTL"
+  export IOS_SIM_GATE_SIMCTL_DEVICES="$TEST_ROOT/devices.json"
+  export IOS_SIM_GATE_SIMCTL_TESTING_DEVICES="$TEST_ROOT/testing-devices.json"
+  export IOS_SIM_GATE_SIMCTL_LOG="$TEST_ROOT/simctl.log"
+  printf '{"devices":{}}\n' >"$IOS_SIM_GATE_SIMCTL_DEVICES"
+  printf '{"devices":{}}\n' >"$IOS_SIM_GATE_SIMCTL_TESTING_DEVICES"
+  : >"$IOS_SIM_GATE_SIMCTL_LOG"
 }
 
 run_cli() {
@@ -266,6 +275,14 @@ test_global_cap_allows_three_and_times_out_fourth() {
   register_uuid "$uuid_two" build2
   register_uuid "$uuid_three" build3
   register_uuid "$uuid_four" build4
+  cat >"$IOS_SIM_GATE_SIMCTL_DEVICES" <<JSON
+{"devices":{"runtime":[
+  {"udid":"$uuid_one","name":"Gate One","state":"Shutdown"},
+  {"udid":"$uuid_two","name":"Gate Two","state":"Shutdown"},
+  {"udid":"$uuid_three","name":"Gate Three","state":"Shutdown"},
+  {"udid":"$uuid_four","name":"Gate Four","state":"Shutdown"}
+]}}
+JSON
 
   index=1
   for uuid in "$uuid_one" "$uuid_two" "$uuid_three"; do
@@ -301,10 +318,108 @@ run_run_tests() {
   test_global_cap_allows_three_and_times_out_fourth
 }
 
+write_cleanup_inventory() {
+  cat >"$IOS_SIM_GATE_SIMCTL_DEVICES" <<'JSON'
+{"devices":{"runtime":[
+  {"udid":"91111111-1111-1111-1111-111111111111","name":"Stale Registered","state":"Shutdown","dataPathSize":101},
+  {"udid":"92222222-2222-2222-2222-222222222222","name":"Fresh Registered","state":"Shutdown","dataPathSize":202},
+  {"udid":"93333333-3333-3333-3333-333333333333","name":"Locked Registered","state":"Booted","dataPathSize":303},
+  {"udid":"94444444-4444-4444-4444-444444444444","name":"Unregistered Normal","state":"Shutdown","dataPathSize":404}
+]}}
+JSON
+  cat >"$IOS_SIM_GATE_SIMCTL_TESTING_DEVICES" <<'JSON'
+{"devices":{"runtime":[
+  {"udid":"95555555-5555-5555-5555-555555555555","name":"Clone 1 of iPhone 17","state":"Shutdown","dataPathSize":505}
+]}}
+JSON
+}
+
+test_cleanup_respects_registry_locks_and_testing_set() {
+  setup_test
+  write_cleanup_inventory
+  export IOS_SIM_GATE_STALE_SECONDS=3600
+  export IOS_SIM_GATE_NOW="2026-08-10T06:00:00Z"
+  register_uuid 91111111-1111-1111-1111-111111111111 stale
+  register_uuid 93333333-3333-3333-3333-333333333333 locked
+  register_uuid 96666666-6666-6666-6666-666666666666 missing
+  export IOS_SIM_GATE_NOW="2026-08-10T09:00:00Z"
+  register_uuid 92222222-2222-2222-2222-222222222222 fresh
+
+  mkdir -p "$IOS_SIM_GATE_HOME/locks/simulators"
+  "$HOLD_LOCK_HELPER" \
+    "$IOS_SIM_GATE_HOME/locks/simulators/93333333-3333-3333-3333-333333333333.lock" \
+    "$TEST_ROOT/lock-ready" "$TEST_ROOT/lock-release" &
+  local lock_pid=$!
+  wait_for_file "$TEST_ROOT/lock-ready"
+
+  run_cli cleanup
+
+  assert_equal "cleanup succeeds" "0" "$COMMAND_STATUS"
+  assert_contains "cleanup logs stale attribution" \
+    "uuid=91111111-1111-1111-1111-111111111111 owner=family-foqos/stale/default" \
+    "$COMMAND_OUTPUT"
+  assert_contains "cleanup logs stale reason" "reason=stale" "$COMMAND_OUTPUT"
+  assert_contains "cleanup logs approximate bytes" "bytes=101" "$COMMAND_OUTPUT"
+  assert_contains "cleanup reports held UUID" \
+    "uuid=93333333-3333-3333-3333-333333333333 reason=locked" "$COMMAND_OUTPUT"
+  assert_contains "cleanup reports testing fixture" \
+    "uuid=95555555-5555-5555-5555-555555555555 name=Clone 1 of iPhone 17 state=Shutdown bytes=505 reason=testing-set-report-only" \
+    "$COMMAND_OUTPUT"
+  assert_equal "cleanup keeps fresh registry entry" "true" \
+    "$(registry_value 'has("92222222-2222-2222-2222-222222222222")')"
+  assert_equal "cleanup keeps locked registry entry" "true" \
+    "$(registry_value 'has("93333333-3333-3333-3333-333333333333")')"
+  assert_equal "cleanup removes stale registry entry" "false" \
+    "$(registry_value 'has("91111111-1111-1111-1111-111111111111")')"
+  assert_equal "cleanup prunes missing registry entry" "false" \
+    "$(registry_value 'has("96666666-6666-6666-6666-666666666666")')"
+  assert_contains "cleanup deletes exact stale UUID" \
+    "delete 91111111-1111-1111-1111-111111111111" \
+    "$(cat "$IOS_SIM_GATE_SIMCTL_LOG")"
+  assert_contains "cleanup deletes exact unregistered UUID" \
+    "delete 94444444-4444-4444-4444-444444444444" \
+    "$(cat "$IOS_SIM_GATE_SIMCTL_LOG")"
+  case "$(cat "$IOS_SIM_GATE_SIMCTL_LOG")" in
+    *95555555-5555-5555-5555-555555555555*)
+      fail "cleanup never deletes testing fixture" "testing UUID reached destructive simctl" ;;
+    *) pass "cleanup never deletes testing fixture" ;;
+  esac
+
+  touch "$TEST_ROOT/lock-release"
+  wait "$lock_pid"
+}
+
+test_status_reports_registry_inventory_and_process_reality() {
+  setup_test
+  write_cleanup_inventory
+  register_uuid 92222222-2222-2222-2222-222222222222 fresh
+
+  run_cli status
+
+  assert_equal "status succeeds" "0" "$COMMAND_STATUS"
+  assert_contains "status reports registered owner" \
+    "uuid=92222222-2222-2222-2222-222222222222 owner=family-foqos/fresh/default" \
+    "$COMMAND_OUTPUT"
+  assert_contains "status reports simulator state" "state=Shutdown" "$COMMAND_OUTPUT"
+  assert_contains "status reports free UUID lock" "lock=free" "$COMMAND_OUTPUT"
+  assert_contains "status reports unregistered simulator" \
+    "uuid=94444444-4444-4444-4444-444444444444 owner=unregistered" \
+    "$COMMAND_OUTPUT"
+  assert_contains "status labels testing fixture report-only" \
+    "uuid=95555555-5555-5555-5555-555555555555 owner=testing-set-report-only" \
+    "$COMMAND_OUTPUT"
+}
+
+run_cleanup_tests() {
+  test_cleanup_respects_registry_locks_and_testing_set
+  test_status_reports_registry_inventory_and_process_reality
+}
+
 case "$GROUP" in
-  all) run_registry_tests; run_run_tests ;;
+  all) run_registry_tests; run_run_tests; run_cleanup_tests ;;
   registry) run_registry_tests ;;
   run) run_run_tests ;;
+  cleanup) run_cleanup_tests ;;
   *) printf 'unknown test group: %s\n' "$GROUP" >&2; exit 2 ;;
 esac
 
