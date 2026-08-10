@@ -8,6 +8,7 @@ REGISTRY="$STATE_ROOT/registry.json"
 FLOCK_BIN="${IOS_SIM_GATE_FLOCK_BIN:-/opt/homebrew/bin/flock}"
 JQ_BIN="${IOS_SIM_GATE_JQ_BIN:-/opt/homebrew/bin/jq}"
 WAIT_SECONDS="${IOS_SIM_GATE_WAIT_SECONDS:-1800}"
+CACHE_ROOT="${IOS_SIM_GATE_CACHE_HOME:-$HOME/Library/Caches/ios-sim-gate}"
 
 die() {
   printf 'ios-sim-gate: %s\n' "$1" >&2
@@ -20,6 +21,7 @@ ios-sim-gate — machine-wide Xcode simulator registry and run gate
 
 Usage:
   ios-sim-gate register --project NAME --agent NAME [--session NAME] --udid UUID
+  ios-sim-gate run --project NAME --agent NAME [--session NAME] --udid UUID -- COMMAND [ARG ...]
 USAGE
 }
 
@@ -58,13 +60,19 @@ ensure_state() {
   umask 077
   mkdir -p "$LOCK_ROOT/slots" "$LOCK_ROOT/simulators"
   chmod 700 "$STATE_ROOT" "$LOCK_ROOT" "$LOCK_ROOT/slots" "$LOCK_ROOT/simulators"
+  touch "$LOCK_ROOT/admission.lock" "$LOCK_ROOT/registry.lock"
+  touch "$LOCK_ROOT/slots/1.lock" "$LOCK_ROOT/slots/2.lock" "$LOCK_ROOT/slots/3.lock"
 }
 
 acquire_registry_lock() {
   local flock_rc=0
 
   exec 6>>"$LOCK_ROOT/registry.lock"
-  "$FLOCK_BIN" -x -w "$WAIT_SECONDS" 6 || flock_rc=$?
+  if [ "$WAIT_SECONDS" -eq 0 ]; then
+    "$FLOCK_BIN" -n -x 6 || flock_rc=$?
+  else
+    "$FLOCK_BIN" -x -w "$WAIT_SECONDS" 6 || flock_rc=$?
+  fi
   case "$flock_rc" in
     0) ;;
     1) die "timed out after ${WAIT_SECONDS}s waiting for registry lock" ;;
@@ -200,12 +208,156 @@ register_simulator() {
   printf 'registered %s to %s/%s/%s\n' "$uuid" "$project" "$agent" "${session:-default}"
 }
 
+parse_run_arguments() {
+  RUN_PROJECT=""
+  RUN_AGENT=""
+  RUN_SESSION=""
+  RUN_UUID=""
+  RUN_COMMAND=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --project) shift; [ "$#" -gt 0 ] || die "--project requires a value"; RUN_PROJECT="$1" ;;
+      --agent) shift; [ "$#" -gt 0 ] || die "--agent requires a value"; RUN_AGENT="$1" ;;
+      --session) shift; [ "$#" -gt 0 ] || die "--session requires a value"; RUN_SESSION="$1" ;;
+      --udid) shift; [ "$#" -gt 0 ] || die "--udid requires a value"; RUN_UUID="$1" ;;
+      --) shift; RUN_COMMAND=("$@"); break ;;
+      *) die "unknown run argument: $1" ;;
+    esac
+    shift
+  done
+
+  [ -n "$RUN_PROJECT" ] || die "run requires --project"
+  [ -n "$RUN_AGENT" ] || die "run requires --agent"
+  [ -n "$RUN_UUID" ] || die "run requires --udid"
+  [ "${#RUN_COMMAND[@]}" -gt 0 ] || die "run requires a command after --"
+  validate_identifier project "$RUN_PROJECT"
+  validate_identifier agent "$RUN_AGENT"
+  [ -z "$RUN_SESSION" ] || validate_identifier session "$RUN_SESSION"
+  validate_uuid "$RUN_UUID"
+}
+
+validate_run_owner() {
+  local expected_owner
+  local registered_owner
+
+  expected_owner="$(printf '%s\t%s\t%s' "$RUN_PROJECT" "$RUN_AGENT" "$RUN_SESSION")"
+  # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+  registered_owner="$(
+    "$JQ_BIN" -r --arg uuid "$RUN_UUID" \
+      'if has($uuid) then
+         [.[$uuid].project, .[$uuid].agent, (.[$uuid].session // "")] | @tsv
+       else "" end' "$REGISTRY"
+  )"
+  [ "$registered_owner" = "$expected_owner" ] ||
+    die "$RUN_PROJECT/$RUN_AGENT/${RUN_SESSION:-default} does not own simulator $RUN_UUID"
+}
+
+remaining_wait_seconds() {
+  local elapsed=$((SECONDS - RUN_STARTED_AT))
+  local remaining=$((WAIT_SECONDS - elapsed))
+  if [ "$remaining" -lt 0 ]; then
+    remaining=0
+  fi
+  printf '%s\n' "$remaining"
+}
+
+acquire_run_lock() {
+  local label="$1"
+  local mode="$2"
+  local descriptor="$3"
+  local flock_rc=0
+  local remaining
+
+  remaining="$(remaining_wait_seconds)"
+  if [ "$remaining" -eq 0 ]; then
+    "$FLOCK_BIN" -n "$mode" "$descriptor" || flock_rc=$?
+  else
+    "$FLOCK_BIN" "$mode" -w "$remaining" "$descriptor" || flock_rc=$?
+  fi
+  case "$flock_rc" in
+    0) ;;
+    1) die "timed out after ${WAIT_SECONDS}s waiting for $label" ;;
+    *) die "could not acquire $label (flock status $flock_rc)" ;;
+  esac
+}
+
+acquire_global_slot() {
+  local checksum
+  local offset
+  local slot
+  local flock_rc
+
+  checksum="$(printf '%s' "$RUN_UUID" | cksum)"
+  checksum="${checksum%% *}"
+  for offset in 0 1 2; do
+    slot=$(((checksum + offset) % 3 + 1))
+    exec 9>>"$LOCK_ROOT/slots/$slot.lock"
+    flock_rc=0
+    "$FLOCK_BIN" -n -x 9 || flock_rc=$?
+    if [ "$flock_rc" -eq 0 ]; then
+      IOS_SIM_GATE_SLOT="$slot"
+      export IOS_SIM_GATE_SLOT
+      return
+    fi
+    exec 9>&-
+  done
+
+  slot=$((checksum % 3 + 1))
+  exec 9>>"$LOCK_ROOT/slots/$slot.lock"
+  acquire_run_lock "global simulator slot" -x 9
+  IOS_SIM_GATE_SLOT="$slot"
+  export IOS_SIM_GATE_SLOT
+}
+
+refresh_run_owner() {
+  acquire_registry_lock
+  ensure_registry_exists
+  validate_registry
+  validate_run_owner
+  write_registry_entry "$RUN_UUID" "$RUN_PROJECT" "$RUN_AGENT" "$RUN_SESSION" "$(now_utc)"
+  exec 6>&-
+}
+
+run_command() {
+  local derived_data_path
+
+  parse_run_arguments "$@"
+  ensure_state
+
+  acquire_registry_lock
+  ensure_registry_exists
+  validate_registry
+  validate_run_owner
+  exec 6>&-
+
+  RUN_STARTED_AT=$SECONDS
+  exec 8>>"$LOCK_ROOT/simulators/$RUN_UUID.lock"
+  acquire_run_lock "simulator $RUN_UUID" -x 8
+  exec 7>>"$LOCK_ROOT/admission.lock"
+  acquire_run_lock "shared admission lock" -s 7
+  acquire_global_slot
+  refresh_run_owner
+
+  derived_data_path="$CACHE_ROOT/DerivedData/$RUN_PROJECT/$RUN_AGENT/${RUN_SESSION:-default}"
+  mkdir -p "$derived_data_path"
+  export IOS_SIM_GATE_UDID="$RUN_UUID"
+  export IOS_SIM_GATE_DESTINATION="platform=iOS Simulator,id=$RUN_UUID"
+  export IOS_SIM_GATE_DERIVED_DATA_PATH="$derived_data_path"
+  export IOS_SIM_GATE_PROJECT="$RUN_PROJECT"
+  export IOS_SIM_GATE_AGENT="$RUN_AGENT"
+  export IOS_SIM_GATE_SESSION="$RUN_SESSION"
+
+  exec "${RUN_COMMAND[@]}"
+}
+
 require_executable "$FLOCK_BIN"
 require_executable "$JQ_BIN"
 validate_wait_seconds
 
 case "${1:-}" in
   register) shift; register_simulator "$@" ;;
+  run) shift; run_command "$@" ;;
   -h|--help) usage ;;
   "") usage >&2; exit 1 ;;
   *) die "unknown command: $1" ;;

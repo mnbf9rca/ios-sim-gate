@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+set -eu
+
+output="$1"
+status="$2"
+
+printf '%s\n' \
+  "IOS_SIM_GATE_UDID=${IOS_SIM_GATE_UDID:-}" \
+  "IOS_SIM_GATE_DESTINATION=${IOS_SIM_GATE_DESTINATION:-}" \
+  "IOS_SIM_GATE_DERIVED_DATA_PATH=${IOS_SIM_GATE_DERIVED_DATA_PATH:-}" \
+  "IOS_SIM_GATE_PROJECT=${IOS_SIM_GATE_PROJECT:-}" \
+  "IOS_SIM_GATE_AGENT=${IOS_SIM_GATE_AGENT:-}" \
+  "IOS_SIM_GATE_SESSION=${IOS_SIM_GATE_SESSION:-}" >"$output"
+
+exit "$status"
