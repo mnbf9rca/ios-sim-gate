@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+STATE_ROOT="${IOS_SIM_GATE_HOME:-$HOME/Library/Application Support/ios-sim-gate}"
+LOCK_ROOT="$STATE_ROOT/locks"
+REGISTRY="$STATE_ROOT/registry.json"
+FLOCK_BIN="${IOS_SIM_GATE_FLOCK_BIN:-/opt/homebrew/bin/flock}"
+JQ_BIN="${IOS_SIM_GATE_JQ_BIN:-/opt/homebrew/bin/jq}"
+WAIT_SECONDS="${IOS_SIM_GATE_WAIT_SECONDS:-1800}"
+
+die() {
+  printf 'ios-sim-gate: %s\n' "$1" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+ios-sim-gate — machine-wide Xcode simulator registry and run gate
+
+Usage:
+  ios-sim-gate register --project NAME --agent NAME [--session NAME] --udid UUID
+USAGE
+}
+
+require_executable() {
+  [ -x "$1" ] || die "required executable not found: $1"
+}
+
+validate_wait_seconds() {
+  case "$WAIT_SECONDS" in
+    0|[1-9]|[1-9][0-9]*) ;;
+    *) die "IOS_SIM_GATE_WAIT_SECONDS must be a canonical non-negative integer" ;;
+  esac
+}
+
+validate_identifier() {
+  local label="$1"
+  local value="$2"
+  [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
+    die "invalid $label: $value"
+}
+
+validate_uuid() {
+  [[ "$1" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
+    die "invalid simulator UUID: $1"
+}
+
+now_utc() {
+  if [ -n "${IOS_SIM_GATE_NOW:-}" ]; then
+    printf '%s\n' "$IOS_SIM_GATE_NOW"
+  else
+    /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'
+  fi
+}
+
+ensure_state() {
+  umask 077
+  mkdir -p "$LOCK_ROOT/slots" "$LOCK_ROOT/simulators"
+  chmod 700 "$STATE_ROOT" "$LOCK_ROOT" "$LOCK_ROOT/slots" "$LOCK_ROOT/simulators"
+}
+
+acquire_registry_lock() {
+  local flock_rc=0
+
+  exec 6>>"$LOCK_ROOT/registry.lock"
+  "$FLOCK_BIN" -x -w "$WAIT_SECONDS" 6 || flock_rc=$?
+  case "$flock_rc" in
+    0) ;;
+    1) die "timed out after ${WAIT_SECONDS}s waiting for registry lock" ;;
+    *) die "could not acquire registry lock (flock status $flock_rc)" ;;
+  esac
+}
+
+ensure_registry_exists() {
+  if [ ! -e "$REGISTRY" ]; then
+    printf '{}\n' >"$REGISTRY"
+    chmod 600 "$REGISTRY"
+  fi
+}
+
+validate_registry() {
+  # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+  "$JQ_BIN" -e '
+    type == "object" and
+    all(
+      to_entries[];
+      (.key | test("^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")) and
+      (.value | type == "object") and
+      (.value.project | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+      (.value.agent | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+      (.value.lastupdated | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+      ((.value | has("session") | not) or
+       (.value.session | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"))) and
+      ([.value | keys[]] - ["agent", "lastupdated", "project", "session"] | length == 0)
+    ) and
+    (
+      [to_entries[] | [.value.project, .value.agent, (.value.session // "")]] as $owners |
+      ($owners | length) == ($owners | unique | length)
+    )
+  ' "$REGISTRY" >/dev/null 2>&1 || die "registry is invalid: $REGISTRY"
+}
+
+write_registry_entry() {
+  local uuid="$1"
+  local project="$2"
+  local agent="$3"
+  local session="$4"
+  local timestamp="$5"
+  local entry
+  local temporary
+
+  entry="$(
+    # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+    "$JQ_BIN" -n \
+      --arg project "$project" \
+      --arg agent "$agent" \
+      --arg session "$session" \
+      --arg lastupdated "$timestamp" \
+      '{project: $project, agent: $agent, lastupdated: $lastupdated} +
+       (if $session == "" then {} else {session: $session} end)'
+  )"
+  temporary="$(mktemp "$STATE_ROOT/.registry.XXXXXX")"
+  # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+  if ! "$JQ_BIN" --arg uuid "$uuid" --argjson entry "$entry" \
+    '.[$uuid] = $entry' "$REGISTRY" >"$temporary"; then
+    rm -f "$temporary"
+    die "could not update registry"
+  fi
+  chmod 600 "$temporary"
+  mv "$temporary" "$REGISTRY"
+}
+
+register_simulator() {
+  local project=""
+  local agent=""
+  local session=""
+  local uuid=""
+  local existing_owner
+  local duplicate_uuid
+  local timestamp
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --project) shift; [ "$#" -gt 0 ] || die "--project requires a value"; project="$1" ;;
+      --agent) shift; [ "$#" -gt 0 ] || die "--agent requires a value"; agent="$1" ;;
+      --session) shift; [ "$#" -gt 0 ] || die "--session requires a value"; session="$1" ;;
+      --udid) shift; [ "$#" -gt 0 ] || die "--udid requires a value"; uuid="$1" ;;
+      *) die "unknown register argument: $1" ;;
+    esac
+    shift
+  done
+
+  [ -n "$project" ] || die "register requires --project"
+  [ -n "$agent" ] || die "register requires --agent"
+  [ -n "$uuid" ] || die "register requires --udid"
+  validate_identifier project "$project"
+  validate_identifier agent "$agent"
+  [ -z "$session" ] || validate_identifier session "$session"
+  validate_uuid "$uuid"
+
+  ensure_state
+  acquire_registry_lock
+  ensure_registry_exists
+  validate_registry
+
+  existing_owner="$(
+    # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+    "$JQ_BIN" -r --arg uuid "$uuid" \
+      'if has($uuid) then
+         [.[$uuid].project, .[$uuid].agent, (.[$uuid].session // "")] | @tsv
+       else "" end' "$REGISTRY"
+  )"
+  if [ -n "$existing_owner" ] &&
+     [ "$existing_owner" != "$(printf '%s\t%s\t%s' "$project" "$agent" "$session")" ]; then
+    die "simulator $uuid is registered to another owner"
+  fi
+
+  duplicate_uuid="$(
+    # shellcheck disable=SC2016 # jq expressions intentionally use jq variables.
+    "$JQ_BIN" -r \
+      --arg uuid "$uuid" \
+      --arg project "$project" \
+      --arg agent "$agent" \
+      --arg session "$session" \
+      'to_entries[] |
+       select(
+         .key != $uuid and
+         .value.project == $project and
+         .value.agent == $agent and
+         (.value.session // "") == $session
+       ) |
+       .key' "$REGISTRY"
+  )"
+  [ -z "$duplicate_uuid" ] ||
+    die "$project/$agent/${session:-default} already owns simulator $duplicate_uuid"
+
+  timestamp="$(now_utc)"
+  write_registry_entry "$uuid" "$project" "$agent" "$session" "$timestamp"
+  printf 'registered %s to %s/%s/%s\n' "$uuid" "$project" "$agent" "${session:-default}"
+}
+
+require_executable "$FLOCK_BIN"
+require_executable "$JQ_BIN"
+validate_wait_seconds
+
+case "${1:-}" in
+  register) shift; register_simulator "$@" ;;
+  -h|--help) usage ;;
+  "") usage >&2; exit 1 ;;
+  *) die "unknown command: $1" ;;
+esac
