@@ -4,6 +4,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLI="$ROOT/bin/ios-sim-gate"
+INSTALLER="$ROOT/install.sh"
 ENV_HELPER="$ROOT/tests/helpers/child-env.sh"
 HOLD_HELPER="$ROOT/tests/helpers/hold.sh"
 HOLD_LOCK_HELPER="$ROOT/tests/helpers/hold-lock.sh"
@@ -468,11 +469,95 @@ run_cleanup_tests() {
   test_status_reports_registry_inventory_and_process_reality
 }
 
+run_installer() {
+  set +e
+  COMMAND_OUTPUT="$(HOME="$TEST_ROOT/home" PATH="/usr/bin:/bin" "$INSTALLER" 2>&1)"
+  COMMAND_STATUS=$?
+  set -e
+}
+
+assert_file_contains() {
+  local name="$1"
+  local needle="$2"
+  local path="$3"
+  if [ -f "$path" ] && grep -Fq -- "$needle" "$path"; then
+    pass "$name"
+  else
+    fail "$name" "expected $path to contain '$needle'"
+  fi
+}
+
+test_version_and_installer_contract() {
+  setup_test
+  run_cli --version
+  assert_equal "version command succeeds" "0" "$COMMAND_STATUS"
+  assert_equal "version command is machine-readable" "ios-sim-gate 0.1.0" "$COMMAND_OUTPUT"
+
+  run_installer
+  assert_equal "installer succeeds" "0" "$COMMAND_STATUS"
+  assert_equal "installer links CLI to checkout" "$CLI" \
+    "$(readlink "$TEST_ROOT/home/.local/bin/ios-sim-gate")"
+  assert_equal "installer creates private state root" "700" \
+    "$(stat -f '%Lp' "$TEST_ROOT/home/Library/Application Support/ios-sim-gate")"
+  assert_contains "installer warns when local bin is absent from PATH" \
+    ".local/bin is not on PATH" "$COMMAND_OUTPUT"
+
+  run_installer
+  assert_equal "installer is idempotent" "0" "$COMMAND_STATUS"
+  assert_equal "idempotent install preserves target" "$CLI" \
+    "$(readlink "$TEST_ROOT/home/.local/bin/ios-sim-gate")"
+}
+
+test_installer_refuses_regular_file_collision() {
+  setup_test
+  mkdir -p "$TEST_ROOT/home/.local/bin"
+  printf 'keep-me\n' >"$TEST_ROOT/home/.local/bin/ios-sim-gate"
+
+  run_installer
+
+  assert_equal "installer rejects regular-file collision" "1" "$COMMAND_STATUS"
+  assert_contains "installer explains collision" "refusing to replace non-symlink" "$COMMAND_OUTPUT"
+  assert_equal "installer preserves collided file" "keep-me" \
+    "$(tr -d '\n' <"$TEST_ROOT/home/.local/bin/ios-sim-gate")"
+}
+
+test_readme_records_safety_and_wait_contracts() {
+  assert_file_contains "README documents kernel-arbitrary wake order" \
+    "kernel-arbitrary, not FIFO" "$ROOT/README.md"
+  assert_file_contains "README documents accepted stale recreation" \
+    "deleted and recreated" "$ROOT/README.md"
+  assert_file_contains "README documents exact UUID destination" \
+    "platform=iOS Simulator,id=<UUID>" "$ROOT/README.md"
+  assert_file_contains "README disables parallel test workers" \
+    "-parallel-testing-enabled NO" "$ROOT/README.md"
+  assert_file_contains "README disables concurrent destinations" \
+    "-disable-concurrent-destination-testing" "$ROOT/README.md"
+  assert_file_contains "README states no allocation policy" \
+    "does not select, create, clone, rename, or replace simulators" "$ROOT/README.md"
+  if grep -Eq '(^|[[:space:]])sleep([[:space:]]|$)' "$CLI"; then
+    fail "gate implementation has no polling sleep" "found sleep in $CLI"
+  else
+    pass "gate implementation has no polling sleep"
+  fi
+  if grep -Eq 'simctl[[:space:]]+(create|clone)' "$CLI"; then
+    fail "gate implementation has no allocation operations" "found create/clone in $CLI"
+  else
+    pass "gate implementation has no allocation operations"
+  fi
+}
+
+run_install_tests() {
+  test_version_and_installer_contract
+  test_installer_refuses_regular_file_collision
+  test_readme_records_safety_and_wait_contracts
+}
+
 case "$GROUP" in
-  all) run_registry_tests; run_run_tests; run_cleanup_tests ;;
+  all) run_registry_tests; run_run_tests; run_cleanup_tests; run_install_tests ;;
   registry) run_registry_tests ;;
   run) run_run_tests ;;
   cleanup) run_cleanup_tests ;;
+  install) run_install_tests ;;
   *) printf 'unknown test group: %s\n' "$GROUP" >&2; exit 2 ;;
 esac
 

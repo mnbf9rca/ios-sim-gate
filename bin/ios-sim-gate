@@ -655,6 +655,7 @@ case "${1:-}" in
   run) shift; run_command "$@" ;;
   status) shift; status_command "$@" ;;
   cleanup|reconcile) shift; cleanup_command "$@" ;;
+  --version) printf 'ios-sim-gate 0.1.0\n' ;;
   -h|--help) usage ;;
   "") usage >&2; exit 1 ;;
   *) die "unknown command: $1" ;;
